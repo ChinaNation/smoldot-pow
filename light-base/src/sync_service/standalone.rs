@@ -577,10 +577,15 @@ pub(super) async fn start_standalone_chain<TPlat: PlatformRef>(
                         // Errors of type `JustificationEngineMismatch` indicate that the chain
                         // uses a finality engine that smoldot doesn't recognize. This is a benign
                         // error that shouldn't lead to a ban.
-                        if !matches!(
-                            error,
+                        // `FinalityVerify` errors for unknown target blocks are also benign —
+                        // the peer is gossiping a justification for a block we haven't imported
+                        // yet or that has already been pruned. Common on PoW chains.
+                        let is_benign = matches!(
+                            &error,
                             all::JustificationVerifyError::JustificationEngineMismatch
-                        ) {
+                                | all::JustificationVerifyError::FinalityVerify(_)
+                        );
+                        if !is_benign {
                             log!(
                                 &task.platform,
                                 Warn,

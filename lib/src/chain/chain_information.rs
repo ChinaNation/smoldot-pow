@@ -155,6 +155,7 @@ impl<'a> From<ChainInformationRef<'a>> for ChainInformation {
                         finalized_next_epoch_transition.into(),
                     ),
                 },
+                ChainInformationConsensusRef::Pow => ChainInformationConsensus::Pow,
             },
             finality: info.finality.into(),
         }
@@ -212,6 +213,9 @@ pub enum ChainInformationConsensus {
         /// epoch #0, which can be found by calling the `BabeApi_configuration` runtime function.
         finalized_next_epoch_transition: Box<BabeEpochInformation>,
     },
+
+    /// Chain is using Proof of Work consensus.
+    Pow,
 }
 
 /// Information about a Babe epoch.
@@ -480,6 +484,7 @@ impl<'a> From<&'a ChainInformation> for ChainInformationRef<'a> {
                         .map(|i| (&**i).into()),
                     finalized_next_epoch_transition: (&**finalized_next_epoch_transition).into(),
                 },
+                ChainInformationConsensus::Pow => ChainInformationConsensusRef::Pow,
             },
             finality: (&info.finality).into(),
         }
@@ -512,6 +517,9 @@ pub enum ChainInformationConsensusRef<'a> {
         /// See equivalent field in [`ChainInformationConsensus`].
         finalized_next_epoch_transition: BabeEpochInformationRef<'a>,
     },
+
+    /// Chain is using Proof of Work consensus.
+    Pow,
 }
 
 /// Information about a Babe epoch.

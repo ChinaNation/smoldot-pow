@@ -529,7 +529,29 @@ impl ChainInformationBuild {
                         virtual_machine: inner.virtual_machine.take().unwrap(),
                     };
                 }
-                (false, None, _) => chain_information::ChainInformationConsensus::Unknown,
+                // 中文注释：没有 AuraApi 也没有 BabeApi 时，检查区块头是否包含 PoW digest。
+                // citizenchain 使用 PoW 共识（engine id = "pow_"），不实现 AuraApi/BabeApi。
+                (false, None, _) => {
+                    // 尝试从 finalized block header 检测 PoW digest
+                    let has_pow = match &inner.finalized_block_header {
+                        ConfigFinalizedBlockHeader::Any {
+                            scale_encoded_header,
+                            ..
+                        } => header::decode(scale_encoded_header, inner.block_number_bytes)
+                            .map(|h| h.digest.has_any_pow())
+                            .unwrap_or(false),
+                        ConfigFinalizedBlockHeader::Genesis { .. } => {
+                            // 创世块没有 PoW digest，但链可能仍然是 PoW 链。
+                            // 如果 runtime 不支持 Aura/BABE，默认假定为 PoW。
+                            true
+                        }
+                    };
+                    if has_pow {
+                        chain_information::ChainInformationConsensus::Pow
+                    } else {
+                        chain_information::ChainInformationConsensus::Unknown
+                    }
+                }
                 (
                     false,
                     Some(_),

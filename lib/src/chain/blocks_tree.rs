@@ -207,6 +207,7 @@ impl<T> NonFinalizedTree<T> {
                     block_epoch_information: finalized_block_epoch_information.map(Arc::from),
                     next_epoch_transition: Arc::from(finalized_next_epoch_transition),
                 },
+                chain_information::ChainInformationConsensus::Pow => FinalizedConsensus::Pow,
             },
             finalized_best_score: BestScore {
                 num_primary_slots: 0,
@@ -312,6 +313,7 @@ impl<T> NonFinalizedTree<T> {
                         .map(|info| From::from(&**info)),
                     finalized_next_epoch_transition: next_epoch_transition.as_ref().into(),
                 },
+                FinalizedConsensus::Pow => chain_information::ChainInformationConsensusRef::Pow,
             },
             finality: match &self.finality {
                 Finality::Outsourced => chain_information::ChainInformationFinalityRef::Outsourced,
@@ -431,6 +433,10 @@ impl<T> NonFinalizedTree<T> {
                     .map(|info| From::from(&**info)),
                 finalized_next_epoch_transition: next_epoch.as_ref().into(),
             },
+
+            (FinalizedConsensus::Pow, _) => {
+                chain_information::ChainInformationConsensusRef::Pow
+            }
 
             // Any mismatch of consensus engine between the finalized and best block is not
             // supported at the moment.
@@ -561,6 +567,7 @@ enum FinalizedConsensus {
         /// See [`chain_information::ChainInformationConsensus::Babe::slots_per_epoch`].
         slots_per_epoch: NonZero<u64>,
     },
+    Pow,
 }
 
 /// State of the chain finality engine.
@@ -650,6 +657,7 @@ enum BlockConsensus {
         /// Information about the Babe epoch the block belongs to.
         next_epoch: Arc<chain_information::BabeEpochInformation>,
     },
+    Pow,
 }
 
 /// Information about finality attached to each block.

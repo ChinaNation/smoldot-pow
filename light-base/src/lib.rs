@@ -86,7 +86,7 @@
 extern crate alloc;
 
 use alloc::{borrow::ToOwned as _, boxed::Box, format, string::String, sync::Arc, vec, vec::Vec};
-use core::{num::NonZero, ops, time::Duration};
+use core::{num::NonZero, ops, pin::Pin, time::Duration};
 use hashbrown::{HashMap, hash_map::Entry};
 use itertools::Itertools as _;
 use platform::PlatformRef;
@@ -94,6 +94,7 @@ use smoldot::{
     chain, chain_spec, header,
     informant::HashDisplay,
     libp2p::{multiaddr, peer_id},
+    network::codec,
 };
 
 mod database;
@@ -282,20 +283,257 @@ struct RunningChain<TPlat: platform::PlatformRef> {
 }
 
 struct ChainServices<TPlat: platform::PlatformRef> {
+    genesis_block_hash: [u8; 32],
     network_service: Arc<network_service::NetworkServiceChain<TPlat>>,
     sync_service: Arc<sync_service::SyncService<TPlat>>,
     runtime_service: Arc<runtime_service::RuntimeService<TPlat>>,
     transactions_service: Arc<transactions_service::TransactionsService<TPlat>>,
+    recent_block_cache: Arc<async_lock::Mutex<RecentBlockCache>>,
 }
 
 impl<TPlat: platform::PlatformRef> Clone for ChainServices<TPlat> {
     fn clone(&self) -> Self {
         ChainServices {
+            genesis_block_hash: self.genesis_block_hash,
             network_service: self.network_service.clone(),
             sync_service: self.sync_service.clone(),
             runtime_service: self.runtime_service.clone(),
             transactions_service: self.transactions_service.clone(),
+            recent_block_cache: self.recent_block_cache.clone(),
         }
+    }
+}
+
+const RECENT_BLOCK_CACHE_CAPACITY: usize = 128;
+const RECENT_BLOCK_CACHE_SUBSCRIPTION_BUFFER: usize = 64;
+const RECENT_BLOCK_CACHE_HASHER_SEED: [u8; 16] = *b"gmb-recent-blks!";
+
+#[derive(Clone, Copy)]
+struct RecentObservedBlock {
+    number: u64,
+    parent_hash: Option<[u8; 32]>,
+}
+
+struct RecentBlockCache {
+    capacity: usize,
+    canonical_chain: Vec<(u64, [u8; 32])>,
+    observed_blocks: HashMap<[u8; 32], RecentObservedBlock, util::SipHasherBuild>,
+    finalized: Option<(u64, [u8; 32])>,
+    best: Option<(u64, [u8; 32])>,
+}
+
+impl RecentBlockCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            canonical_chain: Vec::with_capacity(capacity),
+            observed_blocks: HashMap::with_capacity_and_hasher(
+                capacity,
+                util::SipHasherBuild::new(RECENT_BLOCK_CACHE_HASHER_SEED),
+            ),
+            finalized: None,
+            best: None,
+        }
+    }
+
+    fn block_hash(&self, block_number: u64) -> Option<[u8; 32]> {
+        self.canonical_chain
+            .iter()
+            .find_map(|(number, hash)| (*number == block_number).then_some(*hash))
+    }
+
+    fn reset_from_subscription(
+        &mut self,
+        subscribe_all: &sync_service::SubscribeAll,
+        block_number_bytes: usize,
+    ) -> Result<(), String> {
+        let finalized_hash =
+            header::hash_from_scale_encoded_header(&subscribe_all.finalized_block_scale_encoded_header);
+        let finalized_number = header::decode(
+            &subscribe_all.finalized_block_scale_encoded_header,
+            block_number_bytes,
+        )
+        .map_err(|error| format!("Failed to decode finalized block header: {error}"))?
+        .number;
+
+        self.finalized = Some((finalized_number, finalized_hash));
+        self.best = Some((finalized_number, finalized_hash));
+        self.observed_blocks.clear();
+        self.observed_blocks.insert(
+            finalized_hash,
+            RecentObservedBlock {
+                number: finalized_number,
+                parent_hash: None,
+            },
+        );
+
+        for block in &subscribe_all.non_finalized_blocks_ancestry_order {
+            let decoded_header = header::decode(&block.scale_encoded_header, block_number_bytes)
+                .map_err(|error| format!("Failed to decode subscribed block header: {error}"))?;
+            let block_hash = header::hash_from_scale_encoded_header(&block.scale_encoded_header);
+            self.observed_blocks.insert(
+                block_hash,
+                RecentObservedBlock {
+                    number: decoded_header.number,
+                    parent_hash: Some(block.parent_hash),
+                },
+            );
+            if block.is_new_best {
+                self.best = Some((decoded_header.number, block_hash));
+            }
+        }
+
+        self.rebuild_canonical_chain();
+        Ok(())
+    }
+
+    fn apply_notification(
+        &mut self,
+        notification: sync_service::Notification,
+        block_number_bytes: usize,
+    ) -> Result<(), String> {
+        match notification {
+            sync_service::Notification::Block(block) => {
+                let decoded_header = header::decode(&block.scale_encoded_header, block_number_bytes)
+                    .map_err(|error| format!("Failed to decode block notification header: {error}"))?;
+                let block_hash = header::hash_from_scale_encoded_header(&block.scale_encoded_header);
+                self.observed_blocks.insert(
+                    block_hash,
+                    RecentObservedBlock {
+                        number: decoded_header.number,
+                        parent_hash: Some(block.parent_hash),
+                    },
+                );
+                if block.is_new_best {
+                    self.best = Some((decoded_header.number, block_hash));
+                }
+            }
+            sync_service::Notification::BestBlockChanged { hash } => {
+                if let Some(number) = self.number_for_hash(hash) {
+                    self.best = Some((number, hash));
+                }
+            }
+            sync_service::Notification::Finalized {
+                hash,
+                best_block_hash_if_changed,
+                pruned_blocks,
+            } => {
+                for pruned_hash in pruned_blocks {
+                    self.observed_blocks.remove(&pruned_hash);
+                }
+
+                if let Some(number) = self.number_for_hash(hash) {
+                    self.finalized = Some((number, hash));
+                    self.observed_blocks.insert(
+                        hash,
+                        RecentObservedBlock {
+                            number,
+                            parent_hash: None,
+                        },
+                    );
+                }
+
+                if let Some(best_hash) = best_block_hash_if_changed {
+                    if let Some(number) = self.number_for_hash(best_hash) {
+                        self.best = Some((number, best_hash));
+                    }
+                } else if self.best.map(|(_, best_hash)| best_hash) == Some(hash) {
+                    self.best = self.finalized;
+                }
+            }
+        }
+
+        self.rebuild_canonical_chain();
+        Ok(())
+    }
+
+    fn number_for_hash(&self, hash: [u8; 32]) -> Option<u64> {
+        self.observed_blocks
+            .get(&hash)
+            .map(|block| block.number)
+            .or_else(|| {
+                self.canonical_chain
+                    .iter()
+                    .find_map(|(number, entry_hash)| (*entry_hash == hash).then_some(*number))
+            })
+            .or_else(|| {
+                self.finalized
+                    .and_then(|(number, finalized_hash)| (finalized_hash == hash).then_some(number))
+            })
+    }
+
+    fn rebuild_canonical_chain(&mut self) {
+        let Some((finalized_number, finalized_hash)) = self.finalized else {
+            return;
+        };
+
+        let old_chain = core::mem::take(&mut self.canonical_chain);
+        let mut rebuilt = Vec::with_capacity(self.capacity);
+
+        if let Some((best_number, best_hash)) = self.best {
+            let mut current_hash = best_hash;
+            let mut current_number = best_number;
+
+            loop {
+                if !rebuilt.iter().any(|(number, _)| *number == current_number) {
+                    rebuilt.push((current_number, current_hash));
+                }
+
+                if current_hash == finalized_hash {
+                    break;
+                }
+
+                let Some(current_block) = self.observed_blocks.get(&current_hash) else {
+                    break;
+                };
+                let Some(parent_hash) = current_block.parent_hash else {
+                    break;
+                };
+
+                if parent_hash == finalized_hash {
+                    current_hash = parent_hash;
+                    current_number = finalized_number;
+                    continue;
+                }
+
+                let Some(parent_block) = self.observed_blocks.get(&parent_hash) else {
+                    break;
+                };
+                current_hash = parent_hash;
+                current_number = parent_block.number;
+            }
+        }
+
+        if !rebuilt.iter().any(|(number, _)| *number == finalized_number) {
+            rebuilt.push((finalized_number, finalized_hash));
+        }
+
+        for (number, hash) in old_chain {
+            if number < finalized_number && !rebuilt.iter().any(|(entry_number, _)| *entry_number == number) {
+                rebuilt.push((number, hash));
+            }
+        }
+
+        rebuilt.sort_by(|left, right| right.0.cmp(&left.0));
+        if rebuilt.len() > self.capacity {
+            rebuilt.truncate(self.capacity);
+        }
+        self.canonical_chain = rebuilt;
+
+        self.prune_observed_blocks();
+    }
+
+    fn prune_observed_blocks(&mut self) {
+        let min_number = self
+            .best
+            .map(|(number, _)| number.saturating_sub(self.capacity as u64 + 8))
+            .unwrap_or(0);
+        let finalized_hash = self.finalized.map(|(_, hash)| hash);
+        let best_hash = self.best.map(|(_, hash)| hash);
+
+        self.observed_blocks.retain(|hash, block| {
+            block.number >= min_number || Some(*hash) == finalized_hash || Some(*hash) == best_hash
+        });
     }
 }
 
@@ -310,6 +548,34 @@ pub struct AddChainSuccess<TPlat: PlatformRef> {
     /// and `None` if it was [`AddChainConfigJsonRpc::Disabled`]. In other words, you can unwrap
     /// this `Option` if you passed `Enabled`.
     pub json_rpc_responses: Option<JsonRpcResponses<TPlat>>,
+}
+
+/// Typed snapshot of the observable state of a chain.
+pub struct ChainStatusSnapshot {
+    /// Number of peers currently used for syncing.
+    pub peer_count: u64,
+    /// Whether the client is believed to still be catching up with the head.
+    pub is_syncing: bool,
+    /// Number of the current best block.
+    pub best_block_number: u64,
+    /// Hash of the current best block.
+    pub best_block_hash: [u8; 32],
+    /// Number of the current finalized block.
+    pub finalized_block_number: u64,
+    /// Hash of the current finalized block.
+    pub finalized_block_hash: [u8; 32],
+}
+
+/// Typed snapshot of the runtime version of the current best block.
+pub struct ChainRuntimeVersionSnapshot {
+    pub spec_name: String,
+    pub impl_name: String,
+    pub authoring_version: u64,
+    pub spec_version: u64,
+    pub impl_version: u64,
+    pub transaction_version: Option<u64>,
+    pub state_version: Option<u64>,
+    pub apis: Vec<(Vec<u8>, u32)>,
 }
 
 /// Stream of JSON-RPC responses or notifications.
@@ -359,6 +625,481 @@ impl<TPlat: platform::PlatformRef, TChain> Client<TPlat, TChain> {
             chains_by_key: None,
             network_service: None,
         }
+    }
+
+    fn clone_chain_services(&self, chain_id: ChainId) -> Result<ChainServices<TPlat>, String> {
+        let public_api_chain = self
+            .public_api_chains
+            .get(usize::from(chain_id))
+            .ok_or_else(|| format!("Invalid chain id: {}", usize::from(chain_id)))?;
+        let chains_by_key = self
+            .chains_by_key
+            .as_ref()
+            .ok_or_else(|| format!("Chain services not initialized for {}", usize::from(chain_id)))?;
+        let running_chain = chains_by_key
+            .get(&public_api_chain.key)
+            .ok_or_else(|| format!("Chain services missing for {}", usize::from(chain_id)))?;
+        Ok(running_chain.services.clone())
+    }
+
+    /// Returns a typed snapshot of the chain status without going through the legacy JSON-RPC layer.
+    pub fn chain_status_snapshot(
+        &self,
+        chain_id: ChainId,
+    ) -> Result<
+        Pin<Box<dyn core::future::Future<Output = Result<ChainStatusSnapshot, String>> + Send>>,
+        String,
+    > {
+        let services = self.clone_chain_services(chain_id)?;
+        let block_number_bytes = services.sync_service.block_number_bytes();
+
+        Ok(Box::pin(async move {
+            // 中文注释：直接从同步服务抓当前 finalized/best 视图，避免再经过 system_health。
+            let subscribe_all = services.sync_service.subscribe_all(16, false).await;
+            let finalized_block_hash =
+                header::hash_from_scale_encoded_header(&subscribe_all.finalized_block_scale_encoded_header);
+            let finalized_block_number = header::decode(
+                &subscribe_all.finalized_block_scale_encoded_header,
+                block_number_bytes,
+            )
+            .map_err(|error| format!("Failed to decode finalized block header: {error}"))?
+            .number;
+
+            let (best_block_number, best_block_hash) = if let Some(best_non_finalized) =
+                subscribe_all
+                    .non_finalized_blocks_ancestry_order
+                    .iter()
+                    .find(|block| block.is_new_best)
+            {
+                let best_block_number = header::decode(
+                    &best_non_finalized.scale_encoded_header,
+                    block_number_bytes,
+                )
+                .map_err(|error| format!("Failed to decode best block header: {error}"))?
+                .number;
+                let best_block_hash =
+                    header::hash_from_scale_encoded_header(&best_non_finalized.scale_encoded_header);
+                (best_block_number, best_block_hash)
+            } else {
+                (finalized_block_number, finalized_block_hash)
+            };
+
+            let peer_count =
+                u64::try_from(services.sync_service.syncing_peers().await.len()).unwrap_or(u64::MAX);
+            let is_syncing = !services.runtime_service.is_near_head_of_chain_heuristic().await;
+
+            Ok(ChainStatusSnapshot {
+                peer_count,
+                is_syncing,
+                best_block_number,
+                best_block_hash,
+                finalized_block_number,
+                finalized_block_hash,
+            })
+        }))
+    }
+
+    /// Returns a block hash if it is already present in the local sync view.
+    pub fn chain_known_block_hash(
+        &self,
+        chain_id: ChainId,
+        block_number: u64,
+    ) -> Result<
+        Pin<Box<dyn core::future::Future<Output = Result<Option<[u8; 32]>, String>> + Send>>,
+        String,
+    > {
+        let services = self.clone_chain_services(chain_id)?;
+
+        if block_number == 0 {
+            let genesis_block_hash = services.genesis_block_hash;
+            return Ok(Box::pin(async move { Ok(Some(genesis_block_hash)) }));
+        }
+
+        Ok(Box::pin(async move {
+            if let Some(block_hash) = {
+                let cache = services.recent_block_cache.lock().await;
+                cache.block_hash(block_number)
+            } {
+                return Ok(Some(block_hash));
+            }
+
+            let block_number_bytes = services.sync_service.block_number_bytes();
+            // 中文注释：缓存未命中时，再用一次当前同步视图兜住 finalized / non-finalized 头部区间。
+            let subscribe_all = services.sync_service.subscribe_all(16, false).await;
+            let finalized_block_hash =
+                header::hash_from_scale_encoded_header(&subscribe_all.finalized_block_scale_encoded_header);
+            let finalized_block_number = header::decode(
+                &subscribe_all.finalized_block_scale_encoded_header,
+                block_number_bytes,
+            )
+            .map_err(|error| format!("Failed to decode finalized block header: {error}"))?
+            .number;
+
+            if block_number == finalized_block_number {
+                return Ok(Some(finalized_block_hash));
+            }
+
+            for block in &subscribe_all.non_finalized_blocks_ancestry_order {
+                let decoded_header = header::decode(&block.scale_encoded_header, block_number_bytes)
+                    .map_err(|error| format!("Failed to decode known block header: {error}"))?;
+                if decoded_header.number == block_number {
+                    let block_hash =
+                        header::hash_from_scale_encoded_header(&block.scale_encoded_header);
+                    return Ok(Some(block_hash));
+                }
+            }
+
+            Ok(None)
+        }))
+    }
+
+    /// Returns the SCALE-encoded extrinsics of the given block hash without going through legacy JSON-RPC.
+    pub fn chain_block_extrinsics(
+        &self,
+        chain_id: ChainId,
+        block_hash: [u8; 32],
+    ) -> Result<
+        Pin<Box<dyn core::future::Future<Output = Result<Vec<Vec<u8>>, String>> + Send>>,
+        String,
+    > {
+        let services = self.clone_chain_services(chain_id)?;
+
+        if block_hash == services.genesis_block_hash {
+            return Ok(Box::pin(async move { Ok(Vec::new()) }));
+        }
+
+        Ok(Box::pin(async move {
+            // 中文注释：直接按 block hash 向 peer 拉 body，优先避免再走 legacy `chain_getBlock`。
+            let block_data = services
+                .sync_service
+                .clone()
+                .block_query_unknown_number(
+                    block_hash,
+                    codec::BlocksRequestFields {
+                        header: false,
+                        body: true,
+                        justifications: false,
+                    },
+                    3,
+                    Duration::from_secs(12),
+                    NonZero::<u32>::new(1).unwrap(),
+                )
+                .await
+                .map_err(|_| "Failed to download block body from the network".to_string())?;
+
+            block_data
+                .body
+                .ok_or_else(|| "Downloaded block is missing body".to_string())
+        }))
+    }
+
+    /// Returns multiple storage values of the current best block without going through legacy JSON-RPC.
+    pub fn chain_storage_values(
+        &self,
+        chain_id: ChainId,
+        storage_keys: Vec<Vec<u8>>,
+    ) -> Result<
+        Pin<Box<dyn core::future::Future<Output = Result<Vec<Option<Vec<u8>>>, String>> + Send>>,
+        String,
+    > {
+        let services = self.clone_chain_services(chain_id)?;
+        let block_number_bytes = services.sync_service.block_number_bytes();
+
+        Ok(Box::pin(async move {
+            if storage_keys.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let subscribe_all = services.sync_service.subscribe_all(16, false).await;
+            let (block_number, block_hash, block_state_trie_root_hash) =
+                if let Some(best_non_finalized) = subscribe_all
+                    .non_finalized_blocks_ancestry_order
+                    .iter()
+                    .find(|block| block.is_new_best)
+                {
+                    let decoded_header =
+                        header::decode(&best_non_finalized.scale_encoded_header, block_number_bytes)
+                            .map_err(|error| {
+                                format!("Failed to decode best block header: {error}")
+                            })?;
+                    (
+                        decoded_header.number,
+                        header::hash_from_scale_encoded_header(
+                            &best_non_finalized.scale_encoded_header,
+                        ),
+                        *decoded_header.state_root,
+                    )
+                } else {
+                    let decoded_header = header::decode(
+                        &subscribe_all.finalized_block_scale_encoded_header,
+                        block_number_bytes,
+                    )
+                    .map_err(|error| format!("Failed to decode finalized block header: {error}"))?;
+                    (
+                        decoded_header.number,
+                        header::hash_from_scale_encoded_header(
+                            &subscribe_all.finalized_block_scale_encoded_header,
+                        ),
+                        *decoded_header.state_root,
+                    )
+                };
+
+            let mut values: Vec<Option<Option<Vec<u8>>>> =
+                (0..storage_keys.len()).map(|_| None).collect();
+            let mut query = services
+                .sync_service
+                .clone()
+                .storage_query(
+                    block_number,
+                    block_hash,
+                    block_state_trie_root_hash,
+                    storage_keys.iter().cloned().map(|key| sync_service::StorageRequestItem {
+                        key,
+                        ty: sync_service::StorageRequestItemTy::Value,
+                    }),
+                    3,
+                    Duration::from_secs(20),
+                    NonZero::<u32>::new(3).unwrap(),
+                )
+                .advance()
+                .await;
+
+            loop {
+                match query {
+                    sync_service::StorageQueryProgress::Finished => break,
+                    sync_service::StorageQueryProgress::Progress {
+                        request_index,
+                        item: sync_service::StorageResultItem::Value { value, .. },
+                        query: next,
+                    } => {
+                        values[request_index] = Some(value);
+                        query = next.advance().await;
+                    }
+                    sync_service::StorageQueryProgress::Progress { .. } => unreachable!(),
+                    sync_service::StorageQueryProgress::Error(error) => {
+                        return Err(format!("Failed to download storage proof: {error}"));
+                    }
+                }
+            }
+
+            Ok(values.into_iter().map(|value| value.flatten()).collect())
+        }))
+    }
+
+    /// Returns the runtime version of the current best block without going through legacy JSON-RPC.
+    pub fn chain_runtime_version_snapshot(
+        &self,
+        chain_id: ChainId,
+    ) -> Result<
+        Pin<Box<dyn core::future::Future<Output = Result<ChainRuntimeVersionSnapshot, String>>>>,
+        String,
+    > {
+        let services = self.clone_chain_services(chain_id)?;
+
+        Ok(Box::pin(async move {
+            let subscribe_all = services
+                .runtime_service
+                .subscribe_all(16, NonZero::<usize>::new(32).unwrap())
+                .await;
+            let best_non_finalized_hash = subscribe_all
+                .non_finalized_blocks_ancestry_order
+                .iter()
+                .find(|block| block.is_new_best)
+                .map(|block| header::hash_from_scale_encoded_header(&block.scale_encoded_header));
+            let finalized_runtime = subscribe_all.finalized_block_runtime;
+            let subscription = subscribe_all.new_blocks;
+
+            let runtime_spec = if let Some(best_block_hash) = best_non_finalized_hash {
+                let (pinned_runtime, _, _) = services
+                    .runtime_service
+                    .pin_pinned_block_runtime(subscription.id(), best_block_hash)
+                    .await
+                    .map_err(|error| format!("Failed to pin best block runtime: {error}"))?;
+                let runtime_spec = services
+                    .runtime_service
+                    .pinned_runtime_specification(pinned_runtime)
+                    .await
+                    .map_err(|error| format!("Failed to inspect best block runtime: {error}"))?;
+                subscription.unpin_block(best_block_hash).await;
+                runtime_spec
+            } else {
+                finalized_runtime
+                    .map_err(|error| format!("Failed to inspect finalized runtime: {error}"))?
+            };
+
+            Ok(convert_runtime_version_snapshot(&runtime_spec))
+        }))
+    }
+
+    /// Returns the runtime metadata of the current best block without going through legacy JSON-RPC.
+    pub fn chain_metadata(
+        &self,
+        chain_id: ChainId,
+    ) -> Result<
+        Pin<Box<dyn core::future::Future<Output = Result<Vec<u8>, String>>>>,
+        String,
+    > {
+        let services = self.clone_chain_services(chain_id)?;
+
+        Ok(Box::pin(async move {
+            let subscribe_all = services
+                .runtime_service
+                .subscribe_all(16, NonZero::<usize>::new(32).unwrap())
+                .await;
+            let finalized_header = subscribe_all.finalized_block_scale_encoded_header.clone();
+            let best_non_finalized_hash = subscribe_all
+                .non_finalized_blocks_ancestry_order
+                .iter()
+                .find(|block| block.is_new_best)
+                .map(|block| header::hash_from_scale_encoded_header(&block.scale_encoded_header));
+            let subscription = subscribe_all.new_blocks;
+
+            let (pinned_runtime, block_hash, block_state_trie_root_hash, block_number, unpin_hash) =
+                if let Some(best_block_hash) = best_non_finalized_hash {
+                    let (pinned_runtime, block_state_trie_root_hash, block_number) = services
+                        .runtime_service
+                        .pin_pinned_block_runtime(subscription.id(), best_block_hash)
+                        .await
+                        .map_err(|error| format!("Failed to pin best block runtime: {error}"))?;
+                    (
+                        pinned_runtime,
+                        best_block_hash,
+                        block_state_trie_root_hash,
+                        block_number,
+                        Some(best_block_hash),
+                    )
+                } else {
+                    let finalized_block_hash =
+                        header::hash_from_scale_encoded_header(&finalized_header);
+                    let (pinned_runtime, block_state_trie_root_hash, block_number) =
+                        compile_runtime_for_block(
+                            services.sync_service.clone(),
+                            services.runtime_service.clone(),
+                            finalized_block_hash,
+                            &finalized_header,
+                        )
+                        .await?;
+                    (
+                        pinned_runtime,
+                        finalized_block_hash,
+                        block_state_trie_root_hash,
+                        block_number,
+                        None,
+                    )
+                };
+
+            let metadata_result = services
+                .runtime_service
+                .runtime_call(
+                    pinned_runtime,
+                    block_hash,
+                    block_number,
+                    block_state_trie_root_hash,
+                    "Metadata_metadata".to_owned(),
+                    Some(("Metadata".to_owned(), 1..=2)),
+                    Vec::new(),
+                    3,
+                    Duration::from_secs(5),
+                    NonZero::<u32>::new(1).unwrap(),
+                )
+                .await
+                .map_err(|error| format!("Failed to execute Metadata_metadata: {error}"));
+
+            if let Some(best_block_hash) = unpin_hash {
+                subscription.unpin_block(best_block_hash).await;
+            }
+
+            let metadata = metadata_result?;
+            smoldot::json_rpc::methods::remove_metadata_length_prefix(&metadata.output)
+                .map(|metadata| metadata.to_vec())
+                .map_err(|error| format!("Failed to decode metadata. Error: {error}"))
+        }))
+    }
+
+    /// Returns the next usable account nonce of the current best block without going through legacy JSON-RPC.
+    pub fn chain_account_next_index(
+        &self,
+        chain_id: ChainId,
+        account_id: Vec<u8>,
+    ) -> Result<Pin<Box<dyn core::future::Future<Output = Result<u64, String>>>>, String> {
+        let services = self.clone_chain_services(chain_id)?;
+
+        Ok(Box::pin(async move {
+            let subscribe_all = services
+                .runtime_service
+                .subscribe_all(16, NonZero::<usize>::new(32).unwrap())
+                .await;
+            let finalized_header = subscribe_all.finalized_block_scale_encoded_header.clone();
+            let best_non_finalized_hash = subscribe_all
+                .non_finalized_blocks_ancestry_order
+                .iter()
+                .find(|block| block.is_new_best)
+                .map(|block| header::hash_from_scale_encoded_header(&block.scale_encoded_header));
+            let subscription = subscribe_all.new_blocks;
+
+            let (pinned_runtime, block_hash, block_state_trie_root_hash, block_number, unpin_hash) =
+                if let Some(best_block_hash) = best_non_finalized_hash {
+                    let (pinned_runtime, block_state_trie_root_hash, block_number) = services
+                        .runtime_service
+                        .pin_pinned_block_runtime(subscription.id(), best_block_hash)
+                        .await
+                        .map_err(|error| format!("Failed to pin best block runtime: {error}"))?;
+                    (
+                        pinned_runtime,
+                        best_block_hash,
+                        block_state_trie_root_hash,
+                        block_number,
+                        Some(best_block_hash),
+                    )
+                } else {
+                    let finalized_block_hash =
+                        header::hash_from_scale_encoded_header(&finalized_header);
+                    let (pinned_runtime, block_state_trie_root_hash, block_number) =
+                        compile_runtime_for_block(
+                            services.sync_service.clone(),
+                            services.runtime_service.clone(),
+                            finalized_block_hash,
+                            &finalized_header,
+                        )
+                        .await?;
+                    (
+                        pinned_runtime,
+                        finalized_block_hash,
+                        block_state_trie_root_hash,
+                        block_number,
+                        None,
+                    )
+                };
+
+            let nonce_result = services
+                .runtime_service
+                .runtime_call(
+                    pinned_runtime,
+                    block_hash,
+                    block_number,
+                    block_state_trie_root_hash,
+                    "AccountNonceApi_account_nonce".to_owned(),
+                    Some(("AccountNonceApi".to_owned(), 1..=1)),
+                    account_id,
+                    3,
+                    Duration::from_secs(5),
+                    NonZero::<u32>::new(1).unwrap(),
+                )
+                .await
+                .map_err(|error| format!("Failed to execute AccountNonceApi_account_nonce: {error}"));
+
+            if let Some(best_block_hash) = unpin_hash {
+                subscription.unpin_block(best_block_hash).await;
+            }
+
+            let nonce_result = nonce_result?;
+            let nonce_bytes: [u8; 4] = nonce_result
+                .output
+                .as_slice()
+                .try_into()
+                .map_err(|_| "Failed to decode runtime output".to_string())?;
+            Ok(u64::from(u32::from_le_bytes(nonce_bytes)))
+        }))
     }
 
     /// Adds a new chain to the list of chains smoldot tries to synchronize.
@@ -1068,6 +1809,122 @@ impl<TPlat: platform::PlatformRef, TChain> Client<TPlat, TChain> {
     }
 }
 
+fn convert_runtime_version_snapshot(
+    runtime_spec: &'_ smoldot::executor::CoreVersion,
+) -> ChainRuntimeVersionSnapshot {
+    let runtime_spec = runtime_spec.decode();
+    ChainRuntimeVersionSnapshot {
+        spec_name: runtime_spec.spec_name.to_owned(),
+        impl_name: runtime_spec.impl_name.to_owned(),
+        authoring_version: u64::from(runtime_spec.authoring_version),
+        spec_version: u64::from(runtime_spec.spec_version),
+        impl_version: u64::from(runtime_spec.impl_version),
+        transaction_version: runtime_spec.transaction_version.map(u64::from),
+        state_version: runtime_spec.state_version.map(u8::from).map(u64::from),
+        apis: runtime_spec
+            .apis
+            .map(|api| (api.name_hash.to_vec(), api.version))
+            .collect(),
+    }
+}
+
+async fn compile_runtime_for_block<TPlat: platform::PlatformRef>(
+    sync_service: Arc<sync_service::SyncService<TPlat>>,
+    runtime_service: Arc<runtime_service::RuntimeService<TPlat>>,
+    block_hash: [u8; 32],
+    scale_encoded_header: &[u8],
+) -> Result<(runtime_service::PinnedRuntime, [u8; 32], u64), String> {
+    let decoded_header = header::decode(scale_encoded_header, sync_service.block_number_bytes())
+        .map_err(|error| format!("Failed to decode block header: {error}"))?;
+    let block_state_trie_root_hash = *decoded_header.state_root;
+    let block_number = decoded_header.number;
+
+    let mut storage_code = None;
+    let mut storage_heap_pages = None;
+    let mut code_merkle_value = None;
+    let mut code_closest_ancestor_excluding = None;
+
+    let mut query = sync_service
+        .clone()
+        .storage_query(
+            block_number,
+            block_hash,
+            block_state_trie_root_hash,
+            [
+                sync_service::StorageRequestItem {
+                    key: b":code".to_vec(),
+                    ty: sync_service::StorageRequestItemTy::ClosestDescendantMerkleValue,
+                },
+                sync_service::StorageRequestItem {
+                    key: b":code".to_vec(),
+                    ty: sync_service::StorageRequestItemTy::Value,
+                },
+                sync_service::StorageRequestItem {
+                    key: b":heappages".to_vec(),
+                    ty: sync_service::StorageRequestItemTy::Value,
+                },
+            ]
+            .into_iter(),
+            3,
+            Duration::from_secs(20),
+            NonZero::<u32>::new(3).unwrap(),
+        )
+        .advance()
+        .await;
+
+    loop {
+        match query {
+            sync_service::StorageQueryProgress::Finished => break,
+            sync_service::StorageQueryProgress::Progress {
+                request_index: 0,
+                item:
+                    sync_service::StorageResultItem::ClosestDescendantMerkleValue {
+                        closest_descendant_merkle_value,
+                        found_closest_ancestor_excluding,
+                        ..
+                    },
+                query: next,
+            } => {
+                code_merkle_value = closest_descendant_merkle_value;
+                code_closest_ancestor_excluding = found_closest_ancestor_excluding;
+                query = next.advance().await;
+            }
+            sync_service::StorageQueryProgress::Progress {
+                request_index: 1,
+                item: sync_service::StorageResultItem::Value { value, .. },
+                query: next,
+            } => {
+                storage_code = value;
+                query = next.advance().await;
+            }
+            sync_service::StorageQueryProgress::Progress {
+                request_index: 2,
+                item: sync_service::StorageResultItem::Value { value, .. },
+                query: next,
+            } => {
+                storage_heap_pages = value;
+                query = next.advance().await;
+            }
+            sync_service::StorageQueryProgress::Progress { .. } => unreachable!(),
+            sync_service::StorageQueryProgress::Error(error) => {
+                return Err(format!("Failed to download runtime storage: {error}"))
+            }
+        }
+    }
+
+    let pinned_runtime = runtime_service
+        .compile_and_pin_runtime(
+            storage_code,
+            storage_heap_pages,
+            code_merkle_value,
+            code_closest_ancestor_excluding,
+        )
+        .await
+        .map_err(|error| format!("Failed to compile and pin runtime: {error}"))?;
+
+    Ok((pinned_runtime, block_state_trie_root_hash, block_number))
+}
+
 impl<TPlat: platform::PlatformRef, TChain> ops::Index<ChainId> for Client<TPlat, TChain> {
     type Output = TChain;
 
@@ -1135,6 +1992,7 @@ fn start_services<TPlat: platform::PlatformRef>(
     config: StartServicesChainTy<'_, TPlat>,
     network_identify_agent_version: String,
 ) -> ChainServices<TPlat> {
+    let genesis_block_hash = header::hash_from_scale_encoded_header(&genesis_block_scale_encoded_header);
     let network_service = network_service.get_or_insert_with(|| {
         network_service::NetworkService::new(network_service::Config {
             platform: platform.clone(),
@@ -1164,9 +2022,7 @@ fn start_services<TPlat: platform::PlatformRef>(
             // Parachains never use GrandPa.
             None
         },
-        genesis_block_hash: header::hash_from_scale_encoded_header(
-            &genesis_block_scale_encoded_header,
-        ),
+        genesis_block_hash,
         best_block: match &config {
             StartServicesChainTy::RelayChain { chain_information } => (
                 chain_information.as_ref().finalized_block_header.number,
@@ -1187,7 +2043,7 @@ fn start_services<TPlat: platform::PlatformRef>(
                 } else {
                     (
                         0,
-                        header::hash_from_scale_encoded_header(&genesis_block_scale_encoded_header),
+                        genesis_block_hash,
                     )
                 }
             }
@@ -1277,6 +2133,16 @@ fn start_services<TPlat: platform::PlatformRef>(
         }
     };
 
+    let recent_block_cache = Arc::new(async_lock::Mutex::new(RecentBlockCache::new(
+        RECENT_BLOCK_CACHE_CAPACITY,
+    )));
+    spawn_recent_block_cache_task(
+        platform,
+        log_name.clone(),
+        sync_service.clone(),
+        recent_block_cache.clone(),
+    );
+
     // The transactions service lets one send transactions to the peer-to-peer network and watch
     // them being included in the chain.
     // While this service is in principle not needed if it is known ahead of time that no
@@ -1295,9 +2161,40 @@ fn start_services<TPlat: platform::PlatformRef>(
     ));
 
     ChainServices {
+        genesis_block_hash,
         network_service: network_service_chain,
         runtime_service,
         sync_service,
         transactions_service,
+        recent_block_cache,
     }
+}
+
+fn spawn_recent_block_cache_task<TPlat: platform::PlatformRef>(
+    platform: &TPlat,
+    log_name: String,
+    sync_service: Arc<sync_service::SyncService<TPlat>>,
+    recent_block_cache: Arc<async_lock::Mutex<RecentBlockCache>>,
+) {
+    let task_name = format!("recent-block-cache-{log_name}");
+    let block_number_bytes = sync_service.block_number_bytes();
+
+    platform.spawn_task(task_name.into(), async move {
+        loop {
+            let subscribe_all = sync_service
+                .subscribe_all(RECENT_BLOCK_CACHE_SUBSCRIPTION_BUFFER, false)
+                .await;
+
+            {
+                let mut cache = recent_block_cache.lock().await;
+                let _ = cache.reset_from_subscription(&subscribe_all, block_number_bytes);
+            }
+
+            let new_blocks = subscribe_all.new_blocks;
+            while let Ok(notification) = new_blocks.recv().await {
+                let mut cache = recent_block_cache.lock().await;
+                let _ = cache.apply_notification(notification, block_number_bytes);
+            }
+        }
+    });
 }

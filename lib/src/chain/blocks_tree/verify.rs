@@ -97,6 +97,7 @@ impl<T> NonFinalizedTree<T> {
                         current_epoch: block_epoch_information.clone(),
                         next_epoch: next_epoch_transition.clone(),
                     }),
+                    FinalizedConsensus::Pow => Some(BlockConsensus::Pow),
                 };
 
                 let finality = match self.finality {
@@ -160,6 +161,13 @@ impl<T> NonFinalizedTree<T> {
                     slots_per_epoch: *slots_per_epoch,
                     now_from_unix_epoch,
                 },
+                (FinalizedConsensus::Pow, Some(BlockConsensus::Pow)) => {
+                    // 轻客户端不做完整 PoW 哈希验证（安全性由 GRANDPA 最终性保证），
+                    // difficulty 值仅用于格式校验。
+                    verify::header_only::ConfigConsensus::Pow {
+                        difficulty: 1,
+                    }
+                }
                 (FinalizedConsensus::Unknown, None) => {
                     return Err(HeaderVerifyError::UnknownConsensusEngine);
                 }
@@ -357,6 +365,18 @@ impl<T> NonFinalizedTree<T> {
                         },
                     )
                 }
+
+                // PoW block. No epoch or authority transitions to track.
+                (
+                    verify::header_only::Success::Pow { .. },
+                    Some(BlockConsensus::Pow),
+                    FinalizedConsensus::Pow,
+                    _,
+                ) => (
+                    parent_best_score.num_primary_slots + 1,
+                    parent_best_score.num_secondary_slots,
+                    BlockConsensus::Pow,
+                ),
 
                 // Any mismatch between consensus algorithms should have been detected by the
                 // block verification.

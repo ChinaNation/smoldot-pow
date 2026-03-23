@@ -18,7 +18,7 @@
 use crate::{
     chain::chain_information,
     header,
-    verify::{aura, babe},
+    verify::{aura, babe, pow},
 };
 
 use alloc::vec::Vec;
@@ -96,6 +96,12 @@ pub enum ConfigConsensus<'a> {
         /// 00:00:00 UTC on 1 January 1970), ignoring leap seconds.
         now_from_unix_epoch: Duration,
     },
+
+    /// Chain is using the PoW consensus engine.
+    Pow {
+        /// Current PoW difficulty target (U256 represented as u128 for simplicity).
+        difficulty: u128,
+    },
 }
 
 /// Extra items of [`Config`] that are dependant on the finality engine of the chain.
@@ -138,6 +144,12 @@ pub enum Success {
         /// passed as [`ConfigConsensus::Babe::parent_block_epoch`].
         epoch_transition_target: Option<chain_information::BabeEpochInformation>,
     },
+
+    /// Chain is using the PoW consensus engine.
+    Pow {
+        /// Nonce used in the proof of work seal.
+        nonce: u64,
+    },
 }
 
 /// Error that can happen during the verification.
@@ -160,6 +172,9 @@ pub enum Error {
     /// Failed to verify the authenticity of the block with the BABE algorithm.
     #[display("{_0}")]
     BabeVerification(babe::VerifyError),
+    /// Error while verifying PoW header.
+    #[display("{_0}")]
+    PowVerification(pow::VerifyError),
     /// Block schedules a Grandpa authorities change while another change is still in progress.
     GrandpaChangesOverlap,
 }
@@ -280,6 +295,21 @@ pub fn verify(config: Config) -> Result<Success, Error> {
                     slot_number: s.slot_number,
                 }),
                 Err(err) => Err(Error::BabeVerification(err)),
+            }
+        }
+        ConfigConsensus::Pow { difficulty } => {
+            if config.block_header.digest.has_any_aura() || config.block_header.digest.has_any_babe() {
+                return Err(Error::MultipleConsensusEngines);
+            }
+
+            let result = pow::verify_header(pow::VerifyConfig {
+                block_header: config.block_header,
+                difficulty,
+            });
+
+            match result {
+                Ok(success) => Ok(Success::Pow { nonce: success.nonce }),
+                Err(err) => Err(Error::PowVerification(err)),
             }
         }
     }

@@ -399,6 +399,9 @@ impl<T> NonFinalizedTree<T> {
                 *block_epoch_information = current_epoch.clone();
                 *next_epoch_transition = next_epoch.clone();
             }
+            (FinalizedConsensus::Pow, BlockConsensus::Pow) => {
+                // PoW has no per-block consensus state to update on finalization.
+            }
             // Any mismatch of consensus engines between the chain and the newly-finalized block
             // should have been detected when the block got added to the chain.
             _ => unreachable!(),

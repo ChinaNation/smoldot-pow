@@ -204,7 +204,9 @@ pub fn start_warp_sync<TSrc, TRq>(
     }
 
     match config.start_chain_information.as_ref().consensus {
-        ChainInformationConsensusRef::Babe { .. } | ChainInformationConsensusRef::Aura { .. } => {}
+        ChainInformationConsensusRef::Babe { .. }
+        | ChainInformationConsensusRef::Aura { .. }
+        | ChainInformationConsensusRef::Pow => {}
         ChainInformationConsensusRef::Unknown => {
             return Err((
                 config.start_chain_information,
@@ -500,6 +502,7 @@ fn runtime_calls_default_value(
             );
         }
         ChainInformationConsensusRef::Unknown => {}
+        ChainInformationConsensusRef::Pow => {}
     }
     list
 }
