@@ -1729,7 +1729,7 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     // Note that we must call this function before `insert_address`, as documented
                     // in `basic_peering_strategy`.
                     task.peering_strategy
-                        .insert_chain_peer(chain_id, peer_id.clone(), 30); // TODO: constant
+                        .insert_chain_peer(chain_id, peer_id.clone(), 256);
 
                     for addr in addrs {
                         let _ =
@@ -1908,7 +1908,7 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                 // another existing connection or connection attempt with that same peer. However,
                 // it is not possible to be sure that we will reach 0 connections or connection
                 // attempts, and thus we ban the peer every time.
-                let ban_duration = Duration::from_secs(5);
+                let ban_duration = Duration::from_secs(2);
                 task.network.gossip_remove_desired_all(
                     &peer_id,
                     service::GossipKind::ConsensusTransactions,
@@ -2054,7 +2054,7 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     peer_id,
                     ?error,
                 );
-                let ban_duration = Duration::from_secs(15);
+                let ban_duration = Duration::from_secs(3);
 
                 // Note that peer doesn't necessarily have an out slot, as this event might happen
                 // as a result of an inbound gossip connection.
@@ -2106,7 +2106,7 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                     chain = &task.network[chain_id].log_name,
                     peer_id,
                 );
-                let ban_duration = Duration::from_secs(10);
+                let ban_duration = Duration::from_secs(3);
 
                 let _was_in = task.open_gossip_links.remove(&(chain_id, peer_id.clone()));
                 debug_assert!(_was_in.is_some());
@@ -2389,7 +2389,7 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                         // as documented in `basic_peering_strategy`.
                         let insert_outcome =
                             task.peering_strategy
-                                .insert_chain_peer(chain_id, peer_id.clone(), 30); // TODO: constant
+                                .insert_chain_peer(chain_id, peer_id.clone(), 128); // TODO: constant
 
                         if let basic_peering_strategy::InsertChainPeerResult::Inserted {
                             peer_removed,
@@ -2656,7 +2656,7 @@ async fn background_task<TPlat: PlatformRef>(mut task: BackgroundTask<TPlat>) {
                         &expected_peer_id,
                         service::GossipKind::ConsensusTransactions,
                     );
-                    let ban_duration = Duration::from_secs(10);
+                    let ban_duration = Duration::from_secs(3);
                     for (&chain_id, what_happened) in task.peering_strategy.unassign_slots_and_ban(
                         &expected_peer_id,
                         task.platform.now() + ban_duration,
