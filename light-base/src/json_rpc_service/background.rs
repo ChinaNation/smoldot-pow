@@ -866,31 +866,71 @@ pub(super) async fn run<TPlat: PlatformRef>(
                     }
 
                     methods::MethodCall::author_submitExtrinsic { transaction } => {
-                        // Note that this function is misnamed. It should really be called
-                        // "author_submitTransaction".
-
-                        // In Substrate, `author_submitExtrinsic` returns the hash of the
-                        // transaction. It is unclear whether it has to actually be the hash of
-                        // the transaction or if it could be any opaque value. Additionally, there
-                        // isn't any other JSON-RPC method that accepts as parameter the value
-                        // returned here. When in doubt, we return the hash as well.
+                        // 中文注释：使用 submit_and_watch 替代 fire-and-forget 的 submit，
+                        // 等待第一个有意义的状态（Validated/Broadcast/Dropped）后再返回，
+                        // 确保调用方能感知交易验证失败（nonce 错误、era 过期、签名无效等），
+                        // 避免静默丢失导致投票卡住和 nonce 死锁。
 
                         let mut hash_context = blake2_rfc::blake2b::Blake2b::new(32);
                         hash_context.update(&transaction.0);
                         let mut transaction_hash: [u8; 32] = Default::default();
                         transaction_hash.copy_from_slice(hash_context.finalize().as_bytes());
-                        me.transactions_service
-                            .submit_transaction(transaction.0)
-                            .await;
-                        let _ = me
-                            .responses_tx
-                            .send(
-                                methods::Response::author_submitExtrinsic(methods::HashHexString(
-                                    transaction_hash,
+
+                        let mut watcher = Box::pin(
+                            me.transactions_service
+                                .submit_and_watch_transaction(transaction.0, 16, true)
+                                .await,
+                        );
+
+                        // 中文注释：等待第一个有意义的状态，判定交易是否被接受。
+                        let accepted = loop {
+                            match watcher.as_mut().next().await {
+                                // 交易已通过验证或已广播给至少一个 peer
+                                Some(transactions_service::TransactionStatus::Validated) => break true,
+                                Some(transactions_service::TransactionStatus::Broadcast(_)) => break true,
+                                // 交易被丢弃：仅 Finalized 算成功（出块后确认）
+                                Some(transactions_service::TransactionStatus::Dropped(reason)) => {
+                                    log::warn!(
+                                        target: &me.log_target,
+                                        "author_submitExtrinsic: transaction 0x{} dropped: {:?}",
+                                        HashDisplay(&transaction_hash),
+                                        reason,
+                                    );
+                                    break matches!(
+                                        reason,
+                                        transactions_service::DropReason::Finalized { .. }
+                                    );
+                                }
+                                // IncludedBlockUpdate 等中间状态，继续等
+                                Some(_) => continue,
+                                // 通道关闭（不应发生）
+                                None => break false,
+                            }
+                        };
+
+                        if accepted {
+                            let _ = me
+                                .responses_tx
+                                .send(
+                                    methods::Response::author_submitExtrinsic(
+                                        methods::HashHexString(transaction_hash),
+                                    )
+                                    .to_json_response(request_id_json),
+                                )
+                                .await;
+                        } else {
+                            let _ = me
+                                .responses_tx
+                                .send(parse::build_error_response(
+                                    request_id_json,
+                                    parse::ErrorResponse::ServerError(
+                                        -32000,
+                                        "Transaction validation failed or dropped",
+                                    ),
+                                    None,
                                 ))
-                                .to_json_response(request_id_json),
-                            )
-                            .await;
+                                .await;
+                        }
                     }
 
                     methods::MethodCall::author_submitAndWatchExtrinsic { transaction } => {
