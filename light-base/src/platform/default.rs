@@ -207,7 +207,7 @@ impl PlatformRef for Arc<DefaultPlatform> {
     }
 
     fn supports_connection_type(&self, connection_type: ConnectionType) -> bool {
-        // TODO: support WebSocket secure
+        // 支持所有 TCP 和 WebSocket（含 WSS）连接类型。
         matches!(
             connection_type,
             ConnectionType::TcpIpv4
@@ -215,47 +215,62 @@ impl PlatformRef for Arc<DefaultPlatform> {
                 | ConnectionType::TcpDns
                 | ConnectionType::WebSocketIpv4 { .. }
                 | ConnectionType::WebSocketIpv6 { .. }
-                | ConnectionType::WebSocketDns { secure: false, .. }
+                | ConnectionType::WebSocketDns { .. }
         )
     }
 
     fn connect_stream(&self, multiaddr: Address) -> Self::StreamConnectFuture {
-        let (tcp_socket_addr, host_if_websocket): (
+        // 连接模式：TCP 直连 / WS（WebSocket 明文）/ WSS（WebSocket Secure）。
+        enum ConnMode {
+            Tcp,
+            Ws(String),        // host:port
+            Wss(String, String), // host:port, hostname（TLS SNI 用）
+        }
+
+        let (tcp_socket_addr, mode): (
             either::Either<SocketAddr, (String, u16)>,
-            Option<String>,
+            ConnMode,
         ) = match multiaddr {
             Address::TcpDns { hostname, port } => {
-                (either::Right((hostname.to_string(), port)), None)
+                (either::Right((hostname.to_string(), port)), ConnMode::Tcp)
             }
             Address::TcpIp {
                 ip: IpAddr::V4(ip),
                 port,
-            } => (either::Left(SocketAddr::from((ip, port))), None),
+            } => (either::Left(SocketAddr::from((ip, port))), ConnMode::Tcp),
             Address::TcpIp {
                 ip: IpAddr::V6(ip),
                 port,
-            } => (either::Left(SocketAddr::from((ip, port))), None),
+            } => (either::Left(SocketAddr::from((ip, port))), ConnMode::Tcp),
             Address::WebSocketDns {
                 hostname,
                 port,
                 secure: false,
             } => (
                 either::Right((hostname.to_string(), port)),
-                Some(format!("{}:{}", hostname, port)),
+                ConnMode::Ws(format!("{}:{}", hostname, port)),
+            ),
+            Address::WebSocketDns {
+                hostname,
+                port,
+                secure: true,
+            } => (
+                either::Right((hostname.to_string(), port)),
+                ConnMode::Wss(format!("{}:{}", hostname, port), hostname.to_string()),
             ),
             Address::WebSocketIp {
                 ip: IpAddr::V4(ip),
                 port,
             } => {
                 let addr = SocketAddr::from((ip, port));
-                (either::Left(addr), Some(addr.to_string()))
+                (either::Left(addr), ConnMode::Ws(addr.to_string()))
             }
             Address::WebSocketIp {
                 ip: IpAddr::V6(ip),
                 port,
             } => {
                 let addr = SocketAddr::from((ip, port));
-                (either::Left(addr), Some(addr.to_string()))
+                (either::Left(addr), ConnMode::Ws(addr.to_string()))
             }
 
             // The API user of the `PlatformRef` trait is never supposed to open connections of
@@ -263,7 +278,7 @@ impl PlatformRef for Arc<DefaultPlatform> {
             _ => unreachable!(),
         };
 
-        let socket_future = async {
+        let socket_future = async move {
             let tcp_socket = match tcp_socket_addr {
                 either::Left(socket_addr) => smol::net::TcpStream::connect(socket_addr).await,
                 either::Right((dns, port)) => smol::net::TcpStream::connect((&dns[..], port)).await,
@@ -273,8 +288,10 @@ impl PlatformRef for Arc<DefaultPlatform> {
                 let _ = tcp_socket.set_nodelay(true);
             }
 
-            match (tcp_socket, host_if_websocket) {
-                (Ok(tcp_socket), Some(host)) => {
+            match (tcp_socket, mode) {
+                (Ok(tcp_socket), ConnMode::Tcp) => Ok(TcpOrWs::Left(tcp_socket)),
+
+                (Ok(tcp_socket), ConnMode::Ws(host)) => {
                     websocket::websocket_client_handshake(websocket::Config {
                         tcp_socket,
                         host: &host,
@@ -284,7 +301,28 @@ impl PlatformRef for Arc<DefaultPlatform> {
                     .map(TcpOrWs::Right)
                 }
 
-                (Ok(tcp_socket), None) => Ok(TcpOrWs::Left(tcp_socket)),
+                (Ok(tcp_socket), ConnMode::Wss(host, hostname)) => {
+                    // WSS：TCP → TLS → WebSocket。
+                    // 使用自定义证书验证器跳过 CA 校验——P2P 网络中身份认证
+                    // 由 Noise 协议通过 peer ID 完成，TLS 只负责加密传输。
+                    let mut tls_config = rustls::ClientConfig::builder()
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+                        .with_no_client_auth();
+                    // 禁用 ALPN，避免与 WebSocket 握手冲突。
+                    tls_config.alpn_protocols.clear();
+                    let connector = async_tls::TlsConnector::from(Arc::new(tls_config));
+                    let tls_stream = connector.connect(&hostname, tcp_socket).await
+                        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+                    websocket::websocket_client_handshake(websocket::Config {
+                        tcp_socket: tls_stream,
+                        host: &host,
+                        url: "/",
+                    })
+                    .await
+                    .map(TcpOrWs::Wss)
+                }
+
                 (Err(err), _) => Err(err),
             }
         };
@@ -346,7 +384,122 @@ pub struct Stream(
     >,
 );
 
-type TcpOrWs = future::Either<smol::net::TcpStream, websocket::Connection<smol::net::TcpStream>>;
+/// P2P 连接流类型：纯 TCP / WS（WebSocket 明文）/ WSS（WebSocket Secure）。
+enum TcpOrWs {
+    /// 纯 TCP 连接。
+    Left(smol::net::TcpStream),
+    /// WS（WebSocket 明文）连接。
+    Right(websocket::Connection<smol::net::TcpStream>),
+    /// WSS（WebSocket Secure）连接：TCP → TLS → WebSocket。
+    Wss(websocket::Connection<async_tls::client::TlsStream<smol::net::TcpStream>>),
+}
+
+impl futures_util::AsyncRead for TcpOrWs {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> core::task::Poll<io::Result<usize>> {
+        // SAFETY: 内部类型都是 Unpin 的。
+        match self.get_mut() {
+            TcpOrWs::Left(s) => Pin::new(s).poll_read(cx, buf),
+            TcpOrWs::Right(s) => Pin::new(s).poll_read(cx, buf),
+            TcpOrWs::Wss(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl futures_util::AsyncWrite for TcpOrWs {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+        buf: &[u8],
+    ) -> core::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            TcpOrWs::Left(s) => Pin::new(s).poll_write(cx, buf),
+            TcpOrWs::Right(s) => Pin::new(s).poll_write(cx, buf),
+            TcpOrWs::Wss(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            TcpOrWs::Left(s) => Pin::new(s).poll_flush(cx),
+            TcpOrWs::Right(s) => Pin::new(s).poll_flush(cx),
+            TcpOrWs::Wss(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            TcpOrWs::Left(s) => Pin::new(s).poll_close(cx),
+            TcpOrWs::Right(s) => Pin::new(s).poll_close(cx),
+            TcpOrWs::Wss(s) => Pin::new(s).poll_close(cx),
+        }
+    }
+}
+
+/// 自定义 TLS 证书验证器：接受任何证书（含自签证书）。
+///
+/// P2P 网络中 TLS 只负责传输加密，身份认证由 Noise 协议通过 peer ID 完成。
+/// 因此不需要通过 CA 验证对方的 TLS 证书。
+#[derive(Debug)]
+struct NoCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // 接受任何证书——安全性由 Noise 层的 peer ID 验证保证。
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        // 支持所有签名方案。
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::ED448,
+        ]
+    }
+}
 
 #[cfg(test)]
 mod tests {
