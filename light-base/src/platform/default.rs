@@ -305,18 +305,14 @@ impl PlatformRef for Arc<DefaultPlatform> {
                     // WSS：TCP → TLS → WebSocket。
                     // 使用自定义证书验证器跳过 CA 校验——P2P 网络中身份认证
                     // 由 Noise 协议通过 peer ID 完成，TLS 只负责加密传输。
-                    let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                        .with_safe_default_protocol_versions()
-                        .expect("TLS protocol versions")
-                        .dangerous()
+                    let mut tls_config = rustls::ClientConfig::builder()
+                        .with_safe_defaults()
                         .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
                         .with_no_client_auth();
                     // 禁用 ALPN，避免与 WebSocket 握手冲突。
                     tls_config.alpn_protocols.clear();
-                    let connector = futures_rustls::TlsConnector::from(Arc::new(tls_config));
-                    let server_name = rustls::pki_types::ServerName::try_from(hostname.clone())
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-                    let tls_stream = connector.connect(server_name, tcp_socket).await
+                    let connector = async_tls::TlsConnector::from(Arc::new(tls_config));
+                    let tls_stream = connector.connect(&hostname, tcp_socket).await
                         .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
                     websocket::websocket_client_handshake(websocket::Config {
                         tcp_socket: tls_stream,
@@ -395,7 +391,7 @@ enum TcpOrWs {
     /// WS（WebSocket 明文）连接。
     Right(websocket::Connection<smol::net::TcpStream>),
     /// WSS（WebSocket Secure）连接：TCP → TLS → WebSocket。
-    Wss(websocket::Connection<futures_rustls::client::TlsStream<smol::net::TcpStream>>),
+    Wss(websocket::Connection<async_tls::client::TlsStream<smol::net::TcpStream>>),
 }
 
 impl futures_util::AsyncRead for TcpOrWs {
@@ -453,55 +449,20 @@ impl futures_util::AsyncWrite for TcpOrWs {
 ///
 /// P2P 网络中 TLS 只负责传输加密，身份认证由 Noise 协议通过 peer ID 完成。
 /// 因此不需要通过 CA 验证对方的 TLS 证书。
-#[derive(Debug)]
 struct NoCertVerifier;
 
-impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
+impl rustls::client::ServerCertVerifier for NoCertVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
         _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
         // 接受任何证书——安全性由 Noise 层的 peer ID 验证保证。
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        // 支持所有签名方案。
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::ED448,
-        ]
+        Ok(rustls::client::ServerCertVerified::assertion())
     }
 }
 
