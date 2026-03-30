@@ -305,7 +305,9 @@ impl PlatformRef for Arc<DefaultPlatform> {
                     // WSS：TCP → TLS → WebSocket。
                     // 使用自定义证书验证器跳过 CA 校验——P2P 网络中身份认证
                     // 由 Noise 协议通过 peer ID 完成，TLS 只负责加密传输。
-                    let mut tls_config = rustls::ClientConfig::builder()
+                    let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                        .with_safe_default_protocol_versions()
+                        .expect("TLS protocol versions")
                         .dangerous()
                         .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
                         .with_no_client_auth();
