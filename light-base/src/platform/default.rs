@@ -311,8 +311,10 @@ impl PlatformRef for Arc<DefaultPlatform> {
                         .with_no_client_auth();
                     // 禁用 ALPN，避免与 WebSocket 握手冲突。
                     tls_config.alpn_protocols.clear();
-                    let connector = async_tls::TlsConnector::from(Arc::new(tls_config));
-                    let tls_stream = connector.connect(&hostname, tcp_socket).await
+                    let connector = futures_rustls::TlsConnector::from(Arc::new(tls_config));
+                    let server_name = rustls::pki_types::ServerName::try_from(hostname.clone())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+                    let tls_stream = connector.connect(server_name, tcp_socket).await
                         .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
                     websocket::websocket_client_handshake(websocket::Config {
                         tcp_socket: tls_stream,
@@ -391,7 +393,7 @@ enum TcpOrWs {
     /// WS（WebSocket 明文）连接。
     Right(websocket::Connection<smol::net::TcpStream>),
     /// WSS（WebSocket Secure）连接：TCP → TLS → WebSocket。
-    Wss(websocket::Connection<async_tls::client::TlsStream<smol::net::TcpStream>>),
+    Wss(websocket::Connection<futures_rustls::client::TlsStream<smol::net::TcpStream>>),
 }
 
 impl futures_util::AsyncRead for TcpOrWs {
